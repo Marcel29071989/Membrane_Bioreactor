@@ -1,0 +1,531 @@
+---
+title: "MBR_final"
+output: html_document
+date: "2022-12-19"
+editor_options: 
+  chunk_output_type: console
+---
+
+
+#libraries
+
+```{r}
+library(Rcpp)
+library(dada2)
+library(phyloseq)
+library(Biostrings)
+library(ShortRead)
+library(readxl)
+library(purrr)
+library(ggplot2)
+library(boot)
+library(tidyverse)
+library(lubridate)
+library(here)
+library(readxl)
+library(writexl)
+library(ggplot2)
+library(dplyr)
+library(ggfortify)
+library(ggpubr)
+library(aod)
+library(skimr)
+library(scales)
+library(patchwork)
+library(broom)
+library(aod)
+library(Rcpp)
+library(microbiome)
+library(vegan)
+library(plyr)
+library(DESeq2)
+library(apeglm)
+library(patchwork)
+library(plotly)
+library(ggtext)
+```
+
+
+#load sequences
+```{r}
+path <- "MBR_final" 
+list.files(path)
+```
+
+
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+
+
+```{r}
+plotQualityProfile(fnFs[1:2])
+```
+
+```{r}
+plotQualityProfile(fnRs[1:2])
+```
+
+
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(149,149),trimLeft = c(20, 20),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE)
+head(out)
+```
+
+
+#Learning the error
+
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+
+```{r}
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+
+## Plotting the error and compare with model
+
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+```{r}
+plotErrors(errR, nominalQ=TRUE)
+```
+
+
+
+# We are now ready to apply the core sample inference algorithm to the filtered and trimmed sequence data.
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+```
+
+
+```{r}
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+
+
+
+## Inspect returned dada-class object
+```{r}
+dadaFs[[1]]
+```
+
+
+# Merging of paired reads
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, minOverlap = 8, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+# Construction of sequence table
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+
+```{r}
+
+table(nchar(getSequences(seqtab)))
+
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 212:214]
+```
+
+
+# Removal of chimeras
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+sum(seqtab.nochim)/sum(seqtab2)
+
+
+```
+
+
+
+# Track reads through the pipeline
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+
+# Assign Taxonomy
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE)
+
+taxa <- addSpecies(taxa, "silva_species_assignment_v138.1.fa.gz")
+```
+
+
+```{r}
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+# save and load taxa and seqtab
+```{r}
+saveRDS(seqtab.nochim, file ="seqtab.nochim_MBR_final.RDS")
+seqtab.nochim <- readRDS("seqtab.nochim_MBR_final.RDS")
+
+saveRDS(taxa, file ="taxa_MBR_final")
+taxa <- readRDS("taxa_MBR_final")
+
+```
+
+
+
+
+# Metadata of the samples
+
+```{r}
+samdf <- read_excel("MBR_final.xlsx")
+sam_df <- as.data.frame(samdf)
+rownames(sam_df) <- sam_df$Number
+```
+
+
+
+# Creating phyloseq
+
+```{r}
+ps_mbr_final <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(sam_df), 
+               tax_table(taxa))
+
+saveRDS(ps_mbr_final, file ="ps_mbr_final.RDS")
+
+ps <- readRDS("ps_mbr_final.RDS")
+taxa_names(ps) <- paste0("Seq", seq(ntaxa(ps)))
+```
+
+
+
+## microbial community
+
+```{r}
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x) )
+relab_threshold <- 0.01
+ps_relab <- filter_taxa(ps_rel, function(x) !(sum(x < relab_threshold) == length(x)), TRUE)
+ntaxa(ps)
+ntaxa(ps_relab)
+ps_relative <- transform_sample_counts(ps_relab, function(x)  x / sum(x))
+
+
+ps_final <- psmelt(ps_relative)
+```
+
+observed reads
+
+```{r}
+observed
+ps_richness <- subset_samples(ps, NMDS != "NA") 
+ps_richness <- subset_samples(ps_richness, MBR != "enrichment") 
+rich <- as.data.frame(estimate_richness(ps_richness,  measures="Observed"))
+rich$Number <- rownames(rich)
+
+rich$Number <- gsub("X", "",rich$Number)
+rich$Number <- as.numeric(rich$Number)
+rownames(rich) <- NULL
+
+data <- sample_data(ps_richness)
+data <- as_tibble(data)
+rownames(data) <- NULL
+
+observed <- merge(data,rich, by.x="Number", by.y="Number")
+
+observed$final_development <- factor(observed$final_development, levels=c("week1_1 mg/L","week2_3 mg/L", "week3_10 mg/L", "week7_100 mg/L", "week8_100 mg/L","week9_100 mg/L", "week10_100 mg/L", "week1_control","week2_control", "week3_control", "week8_control"))
+
+
+observed %>%
+  filter(MBR %in% c("MBR_1","MBR_2")) %>%
+  ggplot() +
+  geom_point(aes(x=final_development, y=Observed, col= MBR),size=2) +
+  theme_bw() +
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))
+
+shannon
+ps_richness <- subset_samples(ps, NMDS != "NA") 
+ps_richness <- subset_samples(ps_richness, MBR != "enrichment") 
+rich <- as.data.frame(estimate_richness(ps_richness,  measures="Shannon"))
+rich$Number <- rownames(rich)
+
+rich$Number <- gsub("X", "",rich$Number)
+rich$Number <- as.numeric(rich$Number)
+rownames(rich) <- NULL
+
+data <- sample_data(ps_richness)
+data <- as_tibble(data)
+rownames(data) <- NULL
+
+observed <- merge(data,rich, by.x="Number", by.y="Number")
+
+observed$final_development <- factor(observed$final_development, levels=c("week1_1 mg/L","week2_3 mg/L", "week3_10 mg/L", "week7_100 mg/L", "week8_100 mg/L","week9_100 mg/L", "week10_100 mg/L", "week1_control","week2_control", "week3_control", "week8_control"))
+
+
+observed %>%
+  filter(MBR %in% c("MBR_1","MBR_2")) %>%
+  ggplot() +
+  geom_point(aes(x=final_development, y=Shannon, col= MBR),size=2) +
+  theme_bw() +
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))
+```
+
+
+
+
+
+
+# Figures for paper
+
+
+```{r}
+
+MBR<- ps_final %>%
+  filter(final_development!="NA") %>%
+  group_by(Genus, final_development, MBR) %>%
+  dplyr::summarize(Abundance=sum(Abundance))
+
+
+MBR$final_development <- factor(MBR$final_development, levels=c("week1_1 mg/L","week2_3 mg/L", "week3_10 mg/L", "week7_100 mg/L", "week8_100 mg/L","week9_100 mg/L", "week10_100 mg/L", "week1_control","week2_control", "week3_control", "week8_control"))
+
+
+
+index <- which(MBR$Abundance>=0.05)
+genus_to_keep <- unique(MBR[index,"Genus"])
+genus_to_keep <- unname(unlist(genus_to_keep))
+
+MBR$Genus_filter <- ifelse(MBR$Genus %in% genus_to_keep, MBR$Genus,"Zother")
+
+
+   cols <-c("Achromobacter"="yellow", "Acinetobacter" = "green", "Azohydromonas"="lightcyan1","Caulobacter" = "green4",  "Comamonas" ="maroon1", "Cupriavidus" ="royalblue1","Zother"="darkgrey","Elizabethkingia" ="thistle1", "Exiguobacterium"= "firebrick1", "Flectobacillus" = "magenta4", "Labrys" = "grey","Leucobacter"="red", "Methyloversatilis"="orange","Mycobacterium"="snow1", "Paucibacter"="darkgoldenrod", "Plot4-2H12"="lightskyblue1","Pseudomonas"="black", "Sandaracinobacter" = "lightsalmon", "Shinella" = "slateblue3", "Zoogloea" = "pink", "Burkholderia-Caballeronia-Paraburkholderia" ="white", "Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium" = "pink")
+ 
+   
+
+
+plota <- MBR%>%
+  filter(Genus_filter != "Zother") %>%
+  ggplot(aes_string(x = "final_development", y = "Abundance", fill="Genus_filter" )) +
+     geom_bar(stat = "identity", position = "stack", col="black") +
+  theme_bw()+
+  facet_wrap(~MBR,scales ="free_x")+
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))+
+    ylab("Relative abundance") +
+  scale_fill_manual("Genus", values = cols)+
+   xlab("Time and pharmaceutical concentration")+
+  theme(legend.text = element_text(face = "italic"))
+
+
+plotb<- MBR%>%
+  filter(Genus_filter != "Zother", Genus_filter %in% c("Flectobacillus", "Achromobacter", "Acinetobacter", "Comamonas", "Leucobacter", "Pseudomonas", "Cupriavidus"), MBR != "MBR_control") %>%
+  ggplot(aes_string(x = "final_development", y = "Abundance", fill="MBR", color="MBR")) +
+     geom_bar(stat = "identity", position = "dodge") +
+  theme_bw()+
+  facet_wrap("Genus_filter", ncol = 4)+
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))+
+    ylab("Relative abundance")+
+  xlab("Time and pharmaceutical concentration")+
+theme(strip.text = element_text(face = "italic"))+
+   theme(legend.justification = "top")
+
+
+plota/
+  plotb +
+  plot_annotation(tag_levels = 'a')
+
+
+```
+
+# enrichment cultures
+
+```{r}
+
+Enrichment<- ps_final %>%
+  filter(NMDS!="NA", NMDS %in% c("Atenolol", "Caffeine", "Enalapril", "Ibuprofen", "Paracetamol")) %>%
+  group_by(Genus, final_development, MBR, NMDS) %>%
+  dplyr::summarize(Abundance=sum(Abundance))
+
+
+
+index <- which(Enrichment$Abundance>=0.1)
+genus_to_keep <- unique(Enrichment[index,"Genus"])
+genus_to_keep <- unname(unlist(genus_to_keep))
+
+Enrichment$Genus_filter <- ifelse(Enrichment$Genus %in% genus_to_keep, Enrichment$Genus,"Zother")
+
+   cols <-c("Achromobacter"="yellow", "Acinetobacter" = "green","Burkholderia-Caballeronia-Paraburkholderia" ="white", "Klebsiella" ="orange", " Zother"="darkgrey", "Labrys" = "grey","Leucobacter"="red", "Methyloversatilis"="orange","Chryseobacterium"="red", "Paucibacter"="darkgoldenrod", "Plot4-2H12"="lightskyblue1","Pseudomonas"="black", "Sandaracinobacter" = "lightsalmon", "Shinella" = "slateblue3", "Sphingomonas" = "pink", "Sphingobacterium" = "blue")
+
+
+
+
+plot_enrichment <- Enrichment %>%
+  filter(Genus_filter!="Zother") %>%
+  ggplot(aes_string(x = "NMDS", y = "Abundance", fill="Genus_filter" )) +
+     geom_bar(stat = "identity", position = "stack", col="black") +
+  theme_bw()+
+       theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust=0.5, size=9))+
+  ylab("Relative abundance [%]") +
+  scale_fill_manual("Genus", values = cols)+
+  xlab("Batch culture") +
+  theme(legend.text = element_text(face = "italic"))
+  
+ 
+  
+
+
+
+
+```
+
+
+
+```{r}
+ps_relative_NMDS <- subset_samples(ps_relative, NMDS!= "NA")
+
+
+mds_whole <- ps_relative_NMDS@otu_table %>%
+  as.data.frame() %>%
+  metaMDS(., 
+          distance = "bray", # trace = F silences the output
+          k = 2, ## number of dimensions to reduce to
+          try = 100, ## number of random starts to try
+          autotransform = FALSE) ## best not to use
+
+
+mds_whole_res <- ps_relative_NMDS @sam_data %>%
+  as.tibble() %>%
+  bind_cols(as.tibble(scores(mds_whole, display = "sites")))
+
+
+mds_whole_res %>%
+ggplot(aes(x = NMDS1, y = NMDS2, label=NMDS)) +
+  geom_point(aes(color= NMDS, shape=MBR),
+             size = 3) + 
+  geom_text(hjust=-0.1,vjust=0.1,size=3)+
+  theme_bw()
+
+```
+
+#HPLC MBRs
+
+```{r}
+MBR1 <-  read_excel("HPLC_MBR.xlsx", sheet = "MBR1", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric", "numeric"))
+
+MBR1  <- MBR1 %>%
+  pivot_longer(!substrate, names_to = "time", values_to = "degradation_rate")
+
+MBR1$MBR <- "MBR1"
+
+MBR2 <-  read_excel("HPLC_MBR.xlsx", sheet = "MBR2", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric", "numeric"))
+
+MBR2  <- MBR2 %>%
+  pivot_longer(!substrate, names_to = "time", values_to = "degradation_rate")
+
+MBR2$MBR <- "MBR2"
+
+HPLC <- rbind(MBR1,MBR2)
+
+HPLC$time <- factor(HPLC$time, levels=c("week_7","week_8", "week_9", "week_10"))
+
+# error
+
+MBR1_error <-  read_excel("HPLC_MBR.xlsx", sheet = "MBR1 Error", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric", "numeric"))
+
+MBR1_error_1  <- MBR1_error %>%
+  pivot_longer(!substrate, names_to = "time", values_to = "error")
+
+MBR1_error$MBR <- "MBR1"
+
+MBR2_error <-  read_excel("HPLC_MBR.xlsx", sheet = "MBR2 Error", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric", "numeric"))
+
+MBR2_error  <- MBR2_error %>%
+  pivot_longer(!substrate, names_to = "time", values_to = "error")
+
+MBR2_error$MBR <- "MBR2"
+
+HPLC_error <- rbind(MBR1_error,MBR2_error)
+
+HPLC_final <- cbind(HPLC, HPLC_error)
+HPLC_final <-HPLC_final[,-c(5,6,8)]
+HPLC_final <- HPLC_final %>%
+  mutate(upper=degradation_rate+error, lower=degradation_rate-error)
+
+
+HPLC_final$time <- factor(HPLC_final$time, levels=c("week_7","week_8", "week_9", "week_10"))
+
+
+HPLC_final %>%
+ggplot() +
+  geom_point(aes(x= time, y= degradation_rate),
+             size = 3) + 
+  geom_line(aes(x= time, y= degradation_rate,group=substrate),color="grey")+
+geom_errorbar(aes(x=time,ymin=lower, ymax=upper),width=.2)+
+  facet_grid(MBR~substrate)+
+  theme_bw() +
+  labs(y="removal efficiency [%]")+
+    theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+
+
+```
+
+#HPLC enrichment cultures
+
+```{r}
+Enrichments <-  read_excel("HPLC_MBR.xlsx", sheet = "Enrichments", 
+    col_types = c("text", "numeric", "numeric", 
+        "numeric"))
+
+
+
+plot_hplc_enrichments <- Enrichments %>%
+ggplot() +
+  geom_point(aes(x= Day, y= `mg/L average`),
+             size = 1.5) + 
+  geom_line(aes(x= Day, y= `mg/L average`,group=Substrate),color="grey")+
+geom_errorbar(aes(x=Day,ymin=`mg/L average`-Stabw, ymax=`mg/L average`+Stabw),width=.2)+
+  facet_wrap("Substrate", ncol=2)+
+  theme_bw() +
+  labs(y="Concentration [mg/L]", x= "Time [days]") 
+
+plot_enrichment/plot_hplc_enrichments+ plot_annotation(tag_levels = 'a') 
+  
+```
+
